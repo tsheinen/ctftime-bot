@@ -1,4 +1,5 @@
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc, Weekday};
+use futures::{FutureExt, StreamExt};
 use lambda::{handler_fn, Context};
 use select::document::Document;
 use select::predicate::{Class, Descendant, Element};
@@ -135,13 +136,16 @@ async fn lambda_handler(_: serde_json::Value, _: Context) -> Result<(), Error> {
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-// this sucks and should be concurrent
 fn get_icons<'a>(items: impl IntoIterator<Item = &'a String>) -> HashMap<String, Image> {
-    items
-        .into_iter()
-        .map(|ctftime_url| (ctftime_url.to_string(), get_icon(ctftime_url)))
-        .filter_map(|(name, x)| Some((name, futures::executor::block_on(x)?)))
-        .collect::<HashMap<String, Image>>()
+    futures::executor::block_on(futures::future::join_all(
+        items
+            .into_iter()
+            .map(|ctftime_url| (ctftime_url.to_string(), get_icon(ctftime_url)))
+            .map(|(name, fut)| fut.map(|x| (name, x))),
+    ))
+    .into_iter()
+    .filter_map(|(name, x)| Some((name, x?)))
+    .collect::<HashMap<String, Image>>()
 }
 
 async fn get_icon(url: &str) -> Option<Image> {
