@@ -1,5 +1,5 @@
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc, Weekday};
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use lambda::{handler_fn, Context};
 use select::document::Document;
 use select::predicate::{Class, Descendant, Element};
@@ -49,20 +49,18 @@ struct Image {
 async fn lambda_handler(_: serde_json::Value, _: Context) -> Result<(), Error> {
     let args = std::env::var("DISCORD_WEBHOOKS")
         .unwrap()
-        .split(",")
-        .map(|x| x.split(":").collect::<Vec<&str>>())
-        .filter(|x| x.len() >= 2)
-        .map(|x| (x[0], x[1]))
-        .map(|(id, token)| (id.parse::<u64>().unwrap(), token.to_string()))
+        .split(',')
+        .filter_map(|x| {
+            let mut it = x.split(':');
+            Some((it.next()?.parse::<u64>().ok()?, it.next()?.to_string()))
+        })
         .collect::<Vec<_>>();
 
     let (start, end) = {
-        let current_year = chrono::offset::Local::now().year();
-        let current_week = chrono::offset::Local::now().iso_week().week();
-        let next_week = chrono::offset::Local::now()
-            .add(Duration::weeks(1))
-            .iso_week()
-            .week();
+        let now = chrono::offset::Local::now();
+        let current_year = now.year();
+        let current_week = now.iso_week().week();
+        let next_week = now.add(Duration::weeks(1)).iso_week().week();
         (
             DateTime::<Utc>::from_utc(
                 NaiveDateTime::new(
@@ -84,40 +82,37 @@ async fn lambda_handler(_: serde_json::Value, _: Context) -> Result<(), Error> {
     };
 
     let events = reqwest::get(&format!(
-        "https://ctftime.org/api/v1/events/?limit=100&start={}&finish={}",
-        start, end
+        "https://ctftime.org/api/v1/events/?limit=100&start={start}&finish={end}"
     ))
     .await?
     .json::<Vec<Event>>()
     .await?;
 
-    let icons = get_icons(events.iter().map(|x| &x.ctftime_url));
+    let icons = get_icons(events.iter().map(|x| x.ctftime_url.as_str())).await;
 
     let embeds_all = events
-        .iter()
-        .map(|ev| Embed {
-            title: ev.title.clone(),
+        .into_iter()
+        .map(|mut ev| Embed {
+            title: ev.title,
             description: {
                 if ev.description.len() > 100 {
-                    ev.description.clone()[0..100].to_string() + "..."
+                    ev.description[0..100].to_string() + "..."
                 } else {
-                    ev.description.clone()
+                    ev.description
                 }
             },
-            url: ev.url.clone(),
+            url: ev.url,
             color: 7506394,
             author: {
-                let mut org = ev.organizers[0].clone();
-                org.icon_url = icons.get(&ev.ctftime_url).cloned().map(|x| x.src.clone());
+                let mut org = ev.organizers.swap_remove(0);
+                org.icon_url = icons.get(&ev.ctftime_url).cloned().map(|x| x.src);
                 org
             },
         })
         .collect::<Vec<_>>();
 
-    let embeds_chunked = embeds_all.chunks(10).collect::<Vec<_>>();
-
     let client = reqwest::Client::new();
-    for embeds in embeds_chunked {
+    for embeds in embeds_all.chunks(10) {
         for (id, token) in &args {
             client
                 .post(&format!(
@@ -136,16 +131,18 @@ async fn lambda_handler(_: serde_json::Value, _: Context) -> Result<(), Error> {
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-fn get_icons<'a>(items: impl IntoIterator<Item = &'a String>) -> HashMap<String, Image> {
-    futures::executor::block_on(futures::future::join_all(
+async fn get_icons<'a>(items: impl IntoIterator<Item = &'a str>) -> HashMap<String, Image> {
+    let futs = futures::future::join_all(
         items
             .into_iter()
             .map(|ctftime_url| (ctftime_url.to_string(), get_icon(ctftime_url)))
             .map(|(name, fut)| fut.map(|x| (name, x))),
-    ))
-    .into_iter()
-    .filter_map(|(name, x)| Some((name, x?)))
-    .collect::<HashMap<String, Image>>()
+    );
+    futs
+        .await
+        .into_iter()
+        .filter_map(|(name, x)| Some((name, x?)))
+        .collect::<HashMap<String, Image>>()
 }
 
 async fn get_icon(url: &str) -> Option<Image> {
@@ -159,12 +156,12 @@ async fn get_icon(url: &str) -> Option<Image> {
         .into();
     let node = document.find(Descendant(Class("span2"), Element)).next()?;
     let src = node.attr("src").unwrap_or("static/images/nologo.png");
-    let width = node.attr("width").unwrap_or("0");
-    let height = node.attr("height").unwrap_or("0");
+    let width = node.attr("width").and_then(|x| x.parse().ok()).unwrap_or(0);
+    let height = node.attr("height").and_then(|x| x.parse().ok()).unwrap_or(0);
     Some(Image {
-        src: format!("https://ctftime.org/{}", src),
-        width: width.parse::<i32>().unwrap_or(0),
-        height: height.parse::<i32>().unwrap_or(0),
+        src: format!("https://ctftime.org/{src}"),
+        width,
+        height,
     })
 }
 
